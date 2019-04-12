@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+git config user.email "sean@imaginationworks.com.au"
+git config user.name "Sean Xiong"

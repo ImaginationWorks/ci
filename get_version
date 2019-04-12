@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+version=$(echo $REVISION | head -c 7)
+if [ "$(git rev-parse --abbrev-ref HEAD)" != "master" ];
+then echo "$(git rev-parse --abbrev-ref HEAD | head -c 9 | awk '{ print tolower($1) }' | sed 's/[^a-z0-9-]*//g')-$version";
+else echo $version;
+fi;
