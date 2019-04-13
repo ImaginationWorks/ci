@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+set -e
+if [ -z "${REGION}" ]; then
+	echo "Env var REGION not specified";
+	exit 1
+fi
+if [ -z "${ORGANIZATION}" ]; then
+	echo "Env var ORGANIZATION not specified";
+	exit 1
+fi
+if [ -z "${CLUSTER}" ]; then
+	echo "Env var CLUSTER not specified";
+	exit 1
+fi
+if [ -z "${SERVICE}" ]; then
+	echo "Env var SERVICE not specified";
+	exit 1
+fi
+
+# REMOVE BELOW ONCE ECS HAS BEEN FIXED
+if [ -z "${ECS_SERVICE}" ]; then
+	ECS_SERVICE="$SERVICE"
+	echo "Env var ECS_SERVICE not specified, using $SERVICE";
+fi
+
+if [ -z "${VERSION}" ]; then
+	echo "Env var VERSION not specified";
+	exit 1
+fi
+if [ -z "${TASK_NAME}" ]; then
+	TASK_NAME="$CLUSTER-$ECS_SERVICE"
+	echo "Env var TASK_NAME not specified, using $TASK_NAME";
+fi
+TASK_DEF=`aws --region $REGION ecs list-task-definitions | jq -r ".taskDefinitionArns | map( select ( contains (\"$TASK_NAME\")  )) | reverse[0]"`
+if [ "${TASK_DEF}" == "null" ]; then
+	echo "Could not find task definition ";
+	exit 1
+fi
+echo "Updating taskdef $TASK_DEF"
+aws --region $REGION ecs describe-task-definition --task-definition $TASK_DEF | jq 'del(.[].taskDefinitionArn) | del(.[].requiresAttributes) | del(.[].revision) | del(.[].status) | .taskDefinition ' > taskdef.json
+if [ ! -z "${DEBUG}" ]; then
+	echo "-- Existing task definition"
+	cat taskdef.json
+	echo "--"
+fi
+sed -e "s;$ORGANIZATION/$SERVICE:[a-z0-9-]*;$ORGANIZATION/$SERVICE:$VERSION;g" taskdef.json > taskdef_new.json
+if [ ! -z "${DEBUG}" ]; then
+	echo "-- Updated task definition"
+	cat taskdef_new.json
+	echo "--"
+fi
+aws --region $REGION ecs register-task-definition --family $CLUSTER-$ECS_SERVICE --cli-input-json file://taskdef_new.json > taskdef_created.json
+if [ ! -z "${DEBUG}" ]; then
+	echo "-- Created task definition"
+	cat taskdef_created.json
+	echo "--"
+fi
+
+REVISION=`cat taskdef_created.json | jq ".[].revision"`
+ARN=`cat taskdef_created.json | jq -r ".[].taskDefinitionArn"`
+echo "Created revision $REVISION with arn $ARN"
+FAMILY=`cat taskdef_created.json | jq -r ".[].family"`
+echo "Using family $FAMILY"
+DESIRED_COUNT=`aws --region $REGION ecs describe-services --cluster $CLUSTER --service $ECS_SERVICE | jq '.services | .[] | select(.serviceName="$ECS_SERVICE") | .desiredCount '`
+echo "Using desired count $DESIRED_COUNT"
+aws --region $REGION ecs update-service --cluster $CLUSTER --service ${ECS_SERVICE} --task-definition ${FAMILY}:${REVISION} --desired-count ${DESIRED_COUNT} > updated_service.json
+if [ ! -z "${DEBUG}" ]; then
+	echo "-- Updated service"
+	cat updated_service.json
+	echo "--"
+fi
+echo "Waiting for ${FAMILY}:${REVISION} to have a runningCount of ${DESIRED_COUNT}"
+while true
+do
+	# This will filter out a deployment with the matching task and runningcount, this doesn't return the number of running tasks since that's harder to query
+	MATCHED_DEPLOYMENTS=`aws --region $REGION ecs describe-services --cluster=$CLUSTER --services=$ECS_SERVICE | jq ".services[0].deployments | map(select(.taskDefinition==\"$ARN\" and .runningCount==$DESIRED_COUNT)) | length"`
+	if [ $MATCHED_DEPLOYMENTS -eq 1 ]; then
+		echo "Task defintion ${FAMILY}:${REVISION} has desired runningCount $DESIRED_COUNT"
+		break
+	fi
+	sleep 10
+done
+
+echo "Waiting for other deployments of ${FAMILY} to have a runningCount of 0"
+while true
+do
+	MATCHED_DEPLOYMENTS=`aws --region $REGION ecs describe-services --cluster=$CLUSTER --services=$ECS_SERVICE | jq ".services[0].deployments | map(select(.taskDefinition!=\"$ARN\" and .runningCount>0)) | length"`
+	if [ $MATCHED_DEPLOYMENTS -eq 0 ]; then
+		echo "All other deployments of service ${ECS_SERVICE} stopped"
+		break
+	fi
+	sleep 10
+done
+
+echo "Update complete"
